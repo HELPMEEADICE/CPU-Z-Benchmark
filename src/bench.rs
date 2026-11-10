@@ -27,6 +27,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use crate::affinity::pin_thread_to_cpu;
@@ -93,7 +94,7 @@ struct Worker {
     rows: AtomicU32,
     width: AtomicU32,
     buf: Arc<SharedBuf>,
-    thread: std::thread::Thread,
+    thread: OnceLock<std::thread::Thread>,
 }
 
 use std::sync::atomic::AtomicI32;
@@ -111,18 +112,22 @@ impl Worker {
             rows: AtomicU32::new(0),
             width: AtomicU32::new(0),
             buf,
-            thread: std::thread::current(),
+            thread: OnceLock::new(),
         });
         let wh = Arc::clone(&w);
+        // Handshake: the spawned worker publishes its own Thread handle and
+        // only then may dispatch() call unpark(). Without this, the handle
+        // would still refer to the spawning (dispatcher) thread.
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         std::thread::spawn(move || {
             if let Some(c) = cpu {
                 pin_thread_to_cpu(c);
             }
+            let _ = wh.thread.set(std::thread::current());
+            let _ = ready_tx.send(());
             worker_loop(wh);
         });
-        // unpark: we parked before spawn? No: park is inside worker_loop,
-        // the token is consumed only after dispatch. Use a fresh unpark in
-        // dispatch (see below).
+        let _ = ready_rx.recv();
         w
     }
 
@@ -137,7 +142,15 @@ impl Worker {
         self.width.store(job.width as u32, Ordering::Release);
         self.units.store(0, Ordering::Release);
         self.busy.store(true, Ordering::Release);
-        self.thread.unpark();
+        self.wake();
+    }
+
+    /// Wake the worker from `park()`.
+    fn wake(&self) {
+        self.thread
+            .get()
+            .expect("worker thread not initialized")
+            .unpark();
     }
 
     /// Wait until the worker finished its current job.
@@ -270,7 +283,7 @@ pub fn run_single(opts: &BenchOptions) -> (f32, u64, u64) {
     worker.wait_idle();
     units += worker.units.load(Ordering::Acquire) as u64;
     worker.stop.store(true, Ordering::Release);
-    worker.thread.unpark(); // wake parked worker so it can observe stop
+    worker.wake(); // wake parked worker so it can observe stop
 
     let ms = start.elapsed().as_millis() as u64;
     let score = score_of(opts.engine, units, ms);
@@ -321,7 +334,7 @@ pub fn run_multi(opts: &BenchOptions) -> (f32, u64, u64) {
         wk.wait_idle();
         units += wk.units.load(Ordering::Acquire) as u64;
         wk.stop.store(true, Ordering::Release);
-        wk.thread.unpark(); // wake parked worker so it can observe stop
+        wk.wake(); // wake parked worker so it can observe stop
     }
 
     let ms = start.elapsed().as_millis() as u64;
@@ -363,5 +376,37 @@ pub fn run(opts: &BenchOptions) -> BenchResult {
         multi_units,
         single_ms,
         multi_ms,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn dispatch_wakes_worker() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let buf = SharedBuf::new();
+            let worker = Worker::new(Arc::clone(&buf), None);
+            worker.dispatch(&Job {
+                engine: Engine::V1701,
+                x0: 0,
+                y0: 0,
+                row0: 0,
+                rows: 1,
+                width: 16,
+            });
+            worker.wait_idle();
+            worker.stop.store(true, Ordering::Release);
+            worker.wake();
+            let _ = done_tx.send(worker.units.load(Ordering::Acquire));
+        });
+
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            16
+        );
     }
 }
